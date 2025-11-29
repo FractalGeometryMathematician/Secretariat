@@ -1,4 +1,5 @@
 import os
+import json
 import smtplib
 from email.mime.text import MIMEText
 
@@ -11,18 +12,58 @@ from discord import app_commands
 # Environment variables
 # -----------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL")
+
+# Optional global default Gmail (used if server not configured)
+DEFAULT_GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
+DEFAULT_GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
-if not GMAIL_ADDRESS:
-    raise RuntimeError("GMAIL_ADDRESS environment variable is not set.")
-if not GMAIL_APP_PASSWORD:
-    raise RuntimeError("GMAIL_APP_PASSWORD environment variable is not set.")
 if not HF_SPACE_URL:
     raise RuntimeError("HF_SPACE_URL environment variable is not set.")
+
+CONFIG_FILE = "server_email_config.json"
+
+# -----------------------------
+# Load / save per-server Gmail config
+# -----------------------------
+def load_server_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print("Error loading server config:", e)
+        return {}
+
+
+def save_server_config(config: dict) -> None:
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        print("Error saving server config:", e)
+
+
+SERVER_CONFIG = load_server_config()
+
+
+def get_gmail_credentials_for_guild(guild_id: int | None):
+    """Return (gmail_address, app_password) for this server, or default env, or (None, None)."""
+    if guild_id is not None:
+        guild_key = str(guild_id)
+        if guild_key in SERVER_CONFIG:
+            cfg = SERVER_CONFIG[guild_key]
+            return cfg.get("gmail_address"), cfg.get("gmail_app_password")
+
+    # Fallback to global default
+    if DEFAULT_GMAIL_ADDRESS and DEFAULT_GMAIL_APP_PASSWORD:
+        return DEFAULT_GMAIL_ADDRESS, DEFAULT_GMAIL_APP_PASSWORD
+
+    return None, None
+
 
 # -----------------------------
 # Discord bot setup
@@ -71,21 +112,27 @@ def generate_email_from_space(prompt: str) -> str | None:
 # -----------------------------
 # Helper: send email via Gmail
 # -----------------------------
-def send_email(to_email: str, subject: str, body: str) -> bool:
+def send_email(
+    from_gmail: str,
+    app_password: str,
+    to_email: str,
+    subject: str,
+    body: str,
+) -> bool:
     """
-    Sends an email using Gmail SMTP from GMAIL_ADDRESS to to_email.
+    Sends an email using Gmail SMTP from from_gmail to to_email.
     """
     try:
         msg = MIMEText(body)
         msg["Subject"] = subject
-        msg["From"] = GMAIL_ADDRESS
+        msg["From"] = from_gmail
         msg["To"] = to_email
 
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            smtp.login(from_gmail, app_password)
             smtp.send_message(msg)
 
-        print(f"Email sent successfully to {to_email}")
+        print(f"Email sent successfully from {from_gmail} to {to_email}")
         return True
     except Exception as e:
         print("Error sending email:", e)
@@ -93,11 +140,69 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
 
 
 # -----------------------------
+# /setserveremail – bind this server to a Gmail account
+# -----------------------------
+@bot.tree.command(
+    name="setserveremail",
+    description="(Admin only) Configure which Gmail account this server uses to send emails."
+)
+@app_commands.describe(
+    gmail_address="The Gmail address to send from (use a bot-only Gmail!).",
+    app_password="The 16-character Gmail app password for that account."
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def setserveremail_command(
+    interaction: discord.Interaction,
+    gmail_address: str,
+    app_password: str
+):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message(
+            "❌ This command can only be used in a server, not in DMs.",
+            ephemeral=True,
+        )
+
+    guild_key = str(interaction.guild_id)
+
+    # Update in-memory config
+    SERVER_CONFIG[guild_key] = {
+        "gmail_address": gmail_address,
+        "gmail_app_password": app_password,
+    }
+    save_server_config(SERVER_CONFIG)
+
+    # Do NOT echo the password back.
+    await interaction.response.send_message(
+        f"✅ This server is now configured to send email from **{gmail_address}**.\n"
+        "Make sure this is a bot-only Gmail account, not a personal one.",
+        ephemeral=True,  # keep setup private
+    )
+
+
+@setserveremail_command.error
+async def setserveremail_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        # If they don't have admin perms
+        try:
+            await interaction.response.send_message(
+                "❌ You must be a server administrator to use /setserveremail.",
+                ephemeral=True,
+            )
+        except discord.InteractionResponded:
+            await interaction.followup.send(
+                "❌ You must be a server administrator to use /setserveremail.",
+                ephemeral=True,
+            )
+    else:
+        print("Error in /setserveremail:", error)
+
+
+# -----------------------------
 # /sendemail – user writes the full email and it gets sent
 # -----------------------------
 @bot.tree.command(
     name="sendemail",
-    description="Send a custom email to a specific address."
+    description="Send a custom email to a specific address from this server's configured Gmail."
 )
 @app_commands.describe(
     to_email="The recipient's email address (e.g. someone@gmail.com).",
@@ -110,14 +215,21 @@ async def sendemail_command(
     subject: str,
     message: str
 ):
-    # Public response
     await interaction.response.defer()
 
-    success = send_email(to_email, subject, message)
+    from_gmail, app_password = get_gmail_credentials_for_guild(interaction.guild_id)
+    if not from_gmail or not app_password:
+        return await interaction.followup.send(
+            "❌ This server's Gmail is not configured yet.\n"
+            "An admin should run `/setserveremail` first, "
+            "or set GMAIL_ADDRESS and GMAIL_APP_PASSWORD as defaults on the bot.",
+        )
+
+    success = send_email(from_gmail, app_password, to_email, subject, message)
 
     if success:
         await interaction.followup.send(
-            f"✅ Email sent to **{to_email}** with subject **{subject}**."
+            f"✅ Email sent from **{from_gmail}** to **{to_email}** with subject **{subject}**."
         )
     else:
         await interaction.followup.send(
@@ -139,7 +251,6 @@ async def draftemail_command(
     interaction: discord.Interaction,
     idea: str
 ):
-    # Public response
     await interaction.response.defer()
     await interaction.followup.send("✏️ Generating your email with AI…")
 
@@ -149,8 +260,6 @@ async def draftemail_command(
             "❌ AI failed to generate an email. Check the server logs."
         )
 
-    # Just show the draft, do NOT send via SMTP
-    # Wrapped in a code block so it's easy to copy-paste
     preview = f"📝 **Drafted email (not sent):**\n```text\n{email_text}\n```"
     await interaction.followup.send(preview)
 
