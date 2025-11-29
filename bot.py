@@ -22,8 +22,7 @@ if not GMAIL_ADDRESS:
 if not GMAIL_APP_PASSWORD:
     raise RuntimeError("GMAIL_APP_PASSWORD environment variable is not set.")
 if not HF_SPACE_URL:
-    HF_SPACE_URL = "https://vinthebest-secretariat.hf.space/generate"
-    print(f"HF_SPACE_URL not set, using default: {HF_SPACE_URL}")
+    raise RuntimeError("HF_SPACE_URL environment variable is not set.")
 
 # -----------------------------
 # Discord bot setup
@@ -94,7 +93,7 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
 
 
 # -----------------------------
-# /sendemail – user writes the full email
+# /sendemail – user writes the full email and it gets sent
 # -----------------------------
 @bot.tree.command(
     name="sendemail",
@@ -111,7 +110,7 @@ async def sendemail_command(
     subject: str,
     message: str
 ):
-    # Public response (no ephemeral=True)
+    # Public response
     await interaction.response.defer()
 
     success = send_email(to_email, subject, message)
@@ -127,24 +126,20 @@ async def sendemail_command(
 
 
 # -----------------------------
-# /draftemail – AI drafts the email, then sends it
+# /draftemail – ONLY drafts, does NOT send
 # -----------------------------
 @bot.tree.command(
     name="draftemail",
-    description="Use AI to draft an email from an idea, then send it."
+    description="Use AI to draft an email from an idea (does NOT send it)."
 )
 @app_commands.describe(
-    to_email="The recipient's email address (e.g. someone@gmail.com).",
-    subject="The subject line of the email.",
     idea="Describe what the email should say."
 )
 async def draftemail_command(
     interaction: discord.Interaction,
-    to_email: str,
-    subject: str,
     idea: str
 ):
-    # Public response (no ephemeral=True)
+    # Public response
     await interaction.response.defer()
     await interaction.followup.send("✏️ Generating your email with AI…")
 
@@ -154,17 +149,10 @@ async def draftemail_command(
             "❌ AI failed to generate an email. Check the server logs."
         )
 
-    success = send_email(to_email, subject, email_text)
-
-    if success:
-        preview = f"**To:** {to_email}\n**Subject:** {subject}\n\n**Body:**\n{email_text}"
-        await interaction.followup.send(
-            "✅ Email generated and sent!\n\n" + preview
-        )
-    else:
-        await interaction.followup.send(
-            "❌ Generated the email, but sending failed. Check the logs."
-        )
+    # Just show the draft, do NOT send via SMTP
+    # Wrapped in a code block so it's easy to copy-paste
+    preview = f"📝 **Drafted email (not sent):**\n```text\n{email_text}\n```"
+    await interaction.followup.send(preview)
 
 
 # -----------------------------
